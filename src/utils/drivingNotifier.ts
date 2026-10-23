@@ -15,8 +15,17 @@ export async function ensureServiceWorkerRegistered(): Promise<ServiceWorkerRegi
     return null;
   }
   try {
+    const registrations = await navigator.serviceWorker.getRegistrations();
+    for (const reg of registrations) {
+      const scriptUrl = reg.active?.scriptURL || reg.installing?.scriptURL || '';
+      if (scriptUrl && !scriptUrl.includes('sw-commute.js')) {
+        await reg.unregister();
+      }
+    }
     const existing = await navigator.serviceWorker.getRegistration();
-    if (existing) return existing;
+    if (existing && existing.active?.scriptURL?.includes('sw-commute.js')) {
+      return existing;
+    }
     return await navigator.serviceWorker.register('/sw-commute.js');
   } catch {
     return null;

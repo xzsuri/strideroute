@@ -52,7 +52,6 @@ export function useAutocompleteSuggestions(
     const request: any = {
       input: trimmed,
       sessionToken: sessionTokenRef.current,
-      internalUsageAttributionIds: ['gmp_mcp_codeassist_v1_aistudio'],
     };
 
     if (originLocation) {

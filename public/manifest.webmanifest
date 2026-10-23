@@ -1,0 +1,31 @@
+{
+  "id": "/",
+  "name": "StrideRoute — Smart Commute Navigator",
+  "short_name": "StrideRoute",
+  "description": "Location-aware commute assistant that tracks your routine stops, alerts you while driving, and finds the shortest route.",
+  "theme_color": "#0f172a",
+  "background_color": "#020617",
+  "display": "standalone",
+  "start_url": "/",
+  "scope": "/",
+  "icons": [
+    {
+      "src": "/pwa-192x192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/pwa-512x512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/pwa-maskable-512x512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ]
+}

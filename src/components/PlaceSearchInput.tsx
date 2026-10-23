@@ -1,9 +1,7 @@
-// Source: Google Maps Platform Code Assist
-import React, { useState, useCallback, useRef, useEffect } from 'react';
-import { useMapsLibrary } from '@vis.gl/react-google-maps';
+import React, { useState, useEffect, useRef } from 'react';
 import { Search, MapPin, Loader2, X } from 'lucide-react';
-import { useAutocompleteSuggestions } from '../hooks/useAutocompleteSuggestions';
 import { GeoLocation, LivePlace } from '../types/commute';
+import { getDistanceMeters, searchOpenPlaces } from '../utils/openMapServices';
 
 interface PlaceSearchInputProps {
   label: string;
@@ -15,34 +13,6 @@ interface PlaceSearchInputProps {
   isDarkMode?: boolean;
 }
 
-export function extractLivePlace(place: any): LivePlace | null {
-  if (!place || !place.location) return null;
-  const lat = typeof place.location.lat === 'function' ? place.location.lat() : place.location.lat;
-  const lng = typeof place.location.lng === 'function' ? place.location.lng() : place.location.lng;
-
-  let photoURI: string | undefined;
-  if (Array.isArray(place.photos) && place.photos.length > 0) {
-    try {
-      photoURI = place.photos[0].getURI({ maxWidth: 400, maxHeight: 300 });
-    } catch {
-      photoURI = undefined;
-    }
-  }
-
-  return {
-    placeId: place.id || `${lat},${lng}`,
-    displayName: place.displayName || 'Selected Location',
-    formattedAddress: place.formattedAddress || `${lat.toFixed(4)}, ${lng.toFixed(4)}`,
-    location: { lat, lng },
-    rating: typeof place.rating === 'number' ? place.rating : undefined,
-    userRatingCount: typeof place.userRatingCount === 'number' ? place.userRatingCount : undefined,
-    businessStatus: place.businessStatus || undefined,
-    primaryType: place.primaryType || undefined,
-    googleMapsURI: place.googleMapsURI || undefined,
-    photoURI,
-  };
-}
-
 export const PlaceSearchInput: React.FC<PlaceSearchInputProps> = ({
   label,
   placeholder,
@@ -52,16 +22,11 @@ export const PlaceSearchInput: React.FC<PlaceSearchInputProps> = ({
   onClearPlace,
   isDarkMode = false,
 }) => {
-  const placesLib = useMapsLibrary('places');
   const [inputValue, setInputValue] = useState('');
+  const [suggestions, setSuggestions] = useState<LivePlace[]>([]);
+  const [isLoading, setIsLoading] = useState(false);
   const [isOpen, setIsOpen] = useState(false);
-  const [isFetchingDetails, setIsFetchingDetails] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
-
-  const { suggestions, isLoading, resetSession } = useAutocompleteSuggestions(
-    inputValue,
-    originLocation
-  );
 
   useEffect(() => {
     const handleClickOutside = (e: MouseEvent) => {
@@ -73,46 +38,30 @@ export const PlaceSearchInput: React.FC<PlaceSearchInputProps> = ({
     return () => document.removeEventListener('mousedown', handleClickOutside);
   }, []);
 
-  const handleSuggestionClick = useCallback(
-    async (suggestion: google.maps.places.AutocompleteSuggestion) => {
-      if (!placesLib || !suggestion.placePrediction) return;
-      setIsFetchingDetails(true);
-      try {
-        const place = suggestion.placePrediction.toPlace();
-        await place.fetchFields({
-          fields: [
-            'id',
-            'displayName',
-            'formattedAddress',
-            'location',
-            'rating',
-            'userRatingCount',
-            'businessStatus',
-            'primaryType',
-            'googleMapsURI',
-            'photos',
-          ],
-        });
+  useEffect(() => {
+    const trimmed = inputValue.trim();
+    if (trimmed.length < 2) {
+      setSuggestions([]);
+      setIsLoading(false);
+      return;
+    }
 
-        const mapped = extractLivePlace(place);
-        if (mapped) {
-          onSelectPlace(mapped);
-        }
-        setInputValue('');
-        setIsOpen(false);
-        resetSession();
-      } catch (err: any) {
-        console.error('Error fetching place details:', err);
-        const msg = String(err?.message || err || '');
-        if (msg.includes('OVER_QUERY_LIMIT') || msg.includes('RESOURCE_EXHAUSTED') || msg.includes('429')) {
-          window.dispatchEvent(new CustomEvent('gmp-quota-exceeded'));
-        }
-      } finally {
-        setIsFetchingDetails(false);
+    let cancelled = false;
+    setIsLoading(true);
+
+    const timer = window.setTimeout(async () => {
+      const results = await searchOpenPlaces(trimmed, originLocation);
+      if (!cancelled) {
+        setSuggestions(results);
+        setIsLoading(false);
       }
-    },
-    [placesLib, onSelectPlace, resetSession]
-  );
+    }, 260);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [inputValue, originLocation.lat, originLocation.lng]);
 
   return (
     <div ref={containerRef} className="relative w-full">
@@ -144,16 +93,16 @@ export const PlaceSearchInput: React.FC<PlaceSearchInputProps> = ({
               : 'bg-white border-slate-200 text-slate-900 placeholder:text-slate-400'
           }`}
         />
-        {(isLoading || isFetchingDetails) && (
+        {isLoading && (
           <Loader2 className="w-4 h-4 text-blue-500 animate-spin absolute right-3.5" />
         )}
-        {!isLoading && !isFetchingDetails && (inputValue || (currentPlace && onClearPlace)) && (
+        {!isLoading && (inputValue || (currentPlace && onClearPlace)) && (
           <button
             type="button"
             onClick={() => {
               if (inputValue) {
                 setInputValue('');
-                resetSession();
+                setSuggestions([]);
               } else if (onClearPlace) {
                 onClearPlace();
               }
@@ -174,21 +123,18 @@ export const PlaceSearchInput: React.FC<PlaceSearchInputProps> = ({
               : 'bg-white border-slate-200 divide-slate-100'
           }`}
         >
-          {suggestions.map((suggestion, index) => {
-            const pred = suggestion.placePrediction;
-            if (!pred) return null;
-            const mainText = pred.mainText?.text || pred.text?.text || 'Place';
-            const secondaryText = pred.secondaryText?.text || '';
-            const distKm =
-              typeof pred.distanceMeters === 'number'
-                ? `${(pred.distanceMeters / 1000).toFixed(1)} km`
-                : null;
-
+          {suggestions.map((place, index) => {
+            const distKm = `${(getDistanceMeters(originLocation, place.location) / 1000).toFixed(1)} km`;
             return (
               <button
-                key={pred.placeId || index}
+                key={place.placeId || index}
                 type="button"
-                onClick={() => handleSuggestionClick(suggestion)}
+                onClick={() => {
+                  onSelectPlace(place);
+                  setInputValue('');
+                  setSuggestions([]);
+                  setIsOpen(false);
+                }}
                 className={`w-full min-h-[52px] px-4 py-2.5 text-left flex items-start gap-3 transition-colors ${
                   isDarkMode ? 'hover:bg-slate-800' : 'hover:bg-slate-50'
                 }`}
@@ -196,11 +142,10 @@ export const PlaceSearchInput: React.FC<PlaceSearchInputProps> = ({
                 <MapPin className="w-4 h-4 text-blue-500 shrink-0 mt-0.5" />
                 <div className="min-w-0 flex-1">
                   <div className={`text-sm font-medium truncate ${isDarkMode ? 'text-slate-100' : 'text-slate-900'}`}>
-                    {mainText}
+                    {place.displayName}
                   </div>
                   <div className={`text-xs truncate ${isDarkMode ? 'text-slate-400' : 'text-slate-500'}`}>
-                    {secondaryText}
-                    {distKm ? ` · ${distKm}` : ''}
+                    {place.formattedAddress} · {distKm}
                   </div>
                 </div>
               </button>
@@ -211,7 +156,7 @@ export const PlaceSearchInput: React.FC<PlaceSearchInputProps> = ({
               isDarkMode ? 'bg-slate-950 text-slate-500' : 'bg-slate-50 text-slate-500'
             }`}
           >
-            Google Maps
+            OpenStreetMap
           </div>
         </div>
       )}

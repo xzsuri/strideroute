@@ -1,32 +1,24 @@
-// Source: Google Maps Platform Code Assist
 import React, { useEffect, useRef, useState } from 'react';
+import L from 'leaflet';
 import {
-  Map,
-  AdvancedMarker,
-  InfoWindow,
-  useMap,
-  useMapsLibrary,
-} from '@vis.gl/react-google-maps';
-import {
-  Navigation,
-  Coffee,
-  Building2,
-  Sparkles,
   ExternalLink,
   Check,
   Plus,
+  X,
 } from 'lucide-react';
 import {
   ComputedRouteOption,
   DailyRoutineRule,
   GeoLocation,
   LivePlace,
-  RouteLegDetail,
   RouteOptimizationMode,
-  RouteStepDetail,
   TravelModeOption,
 } from '../types/commute';
-import { extractLivePlace } from './PlaceSearchInput';
+import {
+  computeOpenDrivingRoutes,
+  discoverNearbyOpenPlaces,
+  getDistanceMeters,
+} from '../utils/openMapServices';
 
 interface CommuteMapCanvasProps {
   userLocation: GeoLocation;
@@ -37,738 +29,538 @@ interface CommuteMapCanvasProps {
   showTrafficLayer: boolean;
   selectedRouteIndex: number;
   onSelectRouteIndex: (idx: number) => void;
-  onRoutesComputed: (routes: ComputedRouteOption[], isLoading: boolean, error: string | null) => void;
+  onRoutesComputed: (
+    routes: ComputedRouteOption[],
+    isLoading: boolean,
+    error: string | null
+  ) => void;
   nearbySuggestions: LivePlace[];
   onNearbySuggestionsLoaded: (places: LivePlace[], isLoading: boolean) => void;
-  onAutoSeedRoutinePlaces: (pitstop: LivePlace | null, destination: LivePlace | null) => void;
+  onAutoSeedRoutinePlaces: (
+    pitstop: LivePlace | null,
+    destination: LivePlace | null
+  ) => void;
   onSwapPitstop: (place: LivePlace) => void;
   onSetDestination: (place: LivePlace) => void;
   searchCategoryFilter: string;
   isDarkMode?: boolean;
   isCompactPip?: boolean;
+  isMapVisible?: boolean;
 }
 
-function notifyQuotaIfApplicable(err: unknown) {
-  const msg = String((err as any)?.message || err || '');
-  const code = String((err as any)?.code || (err as any)?.status || '');
-  if (
-    msg.includes('OVER_QUERY_LIMIT') ||
-    msg.includes('RESOURCE_EXHAUSTED') ||
-    msg.includes('429') ||
-    msg.includes('QuotaExceeded') ||
-    code === 'OVER_QUERY_LIMIT' ||
-    code === 'RESOURCE_EXHAUSTED' ||
-    code === '429'
-  ) {
-    window.dispatchEvent(new CustomEvent('gmp-quota-exceeded'));
-  }
-}
-
-const MapController: React.FC<CommuteMapCanvasProps & { onMarkerSelect: (place: LivePlace | null) => void }> = ({
-  userLocation,
-  activeRoutine,
-  travelMode,
-  optimizationMode,
-  showTrafficLayer,
-  selectedRouteIndex,
-  onSelectRouteIndex,
-  onRoutesComputed,
-  onNearbySuggestionsLoaded,
-  onAutoSeedRoutinePlaces,
-  searchCategoryFilter,
-}) => {
-  const map = useMap();
-  const routesLib = useMapsLibrary('routes');
-  const placesLib = useMapsLibrary('places');
-
-  const trafficLayerRef = useRef<google.maps.TrafficLayer | null>(null);
-  const polylinesRef = useRef<google.maps.Polyline[]>([]);
-  const seededSlotsRef = useRef<Set<string>>(new Set());
-
-  // 1. Real-Time Traffic Layer overlay
-  useEffect(() => {
-    if (!map) return;
-    if (!trafficLayerRef.current) {
-      trafficLayerRef.current = new google.maps.TrafficLayer();
-    }
-    trafficLayerRef.current.setMap(showTrafficLayer ? map : null);
-
-    return () => {
-      if (trafficLayerRef.current) {
-        trafficLayerRef.current.setMap(null);
-      }
-    };
-  }, [map, showTrafficLayer]);
-
-  // 2. Discover Real Nearby Places & Seed Initial Routine via Places API (New)
-  useEffect(() => {
-    if (!placesLib) return;
-    const { Place, SearchNearbyRankPreference } = placesLib as any;
-    if (!Place) return;
-
-    let cancelled = false;
-    onNearbySuggestionsLoaded([], true);
-
-    async function loadNearbyAndSeed() {
-      try {
-        const primaryTypesMap: Record<string, string[]> = {
-          breakfast_restaurant: ['breakfast_restaurant', 'cafe', 'bakery'],
-          cafe: ['cafe', 'coffee_shop', 'bakery'],
-          restaurant: ['restaurant', 'meal_takeaway', 'cafe'],
-          supermarket: ['supermarket', 'grocery_store', 'convenience_store'],
-          gym: ['gym', 'fitness_center'],
-        };
-
-        const typesToQuery =
-          primaryTypesMap[searchCategoryFilter] ||
-          primaryTypesMap[activeRoutine.pitstopCategory] ||
-          ['cafe', 'breakfast_restaurant', 'restaurant'];
-
-        const nearbyReq: any = {
-          fields: [
-            'id',
-            'displayName',
-            'formattedAddress',
-            'location',
-            'rating',
-            'userRatingCount',
-            'businessStatus',
-            'primaryType',
-            'googleMapsURI',
-            'photos',
-          ],
-          locationRestriction: {
-            center: userLocation,
-            radius: 3500,
-          },
-          includedPrimaryTypes: typesToQuery,
-          maxResultCount: 10,
-          rankPreference: SearchNearbyRankPreference?.POPULARITY || 'POPULARITY',
-          internalUsageAttributionIds: ['gmp_mcp_codeassist_v1_aistudio'],
-        };
-
-        const { places } = await Place.searchNearby(nearbyReq);
-        if (cancelled) return;
-
-        const mappedPlaces: LivePlace[] = (places || [])
-          .map((p: any) => extractLivePlace(p))
-          .filter((p: LivePlace | null): p is LivePlace => p !== null);
-
-        onNearbySuggestionsLoaded(mappedPlaces, false);
-
-        // If the current routine slot doesn't have a real pitstop or destination yet,
-        // automatically seed from live Places API (New) results so the user immediately sees
-        // a complete real-world routine without any hardcoded/hallucinated place data.
-        const slotKey = `${activeRoutine.id}_${userLocation.lat.toFixed(2)}_${userLocation.lng.toFixed(2)}`;
-        if (
-          (!activeRoutine.preferredPitstop || !activeRoutine.destination) &&
-          !seededSlotsRef.current.has(slotKey)
-        ) {
-          seededSlotsRef.current.add(slotKey);
-          const seedPitstop = activeRoutine.preferredPitstop || mappedPlaces[0] || null;
-
-          let seedDestination = activeRoutine.destination;
-          if (!seedDestination) {
-            const destQuery =
-              activeRoutine.timeSlot === 'MORNING'
-                ? 'corporate office business center downtown'
-                : activeRoutine.timeSlot === 'MIDDAY'
-                ? 'coworking space technology hub'
-                : 'residential plaza transit station';
-
-            const textReq: any = {
-              textQuery: destQuery,
-              fields: [
-                'id',
-                'displayName',
-                'formattedAddress',
-                'location',
-                'rating',
-                'userRatingCount',
-                'businessStatus',
-                'primaryType',
-                'googleMapsURI',
-              ],
-              locationBias: {
-                center: {
-                  lat: userLocation.lat + 0.022,
-                  lng: userLocation.lng - 0.018,
-                },
-                radius: 5000,
-              },
-              maxResultCount: 4,
-              internalUsageAttributionIds: ['gmp_mcp_codeassist_v1_aistudio'],
-            };
-
-            const destRes = await Place.searchByText(textReq);
-            if (!cancelled && destRes?.places?.length > 0) {
-              const candidates = destRes.places
-                .map((p: any) => extractLivePlace(p))
-                .filter((p: LivePlace | null): p is LivePlace => p !== null);
-              seedDestination =
-                candidates.find((c: LivePlace) => c.placeId !== seedPitstop?.placeId) ||
-                candidates[0] ||
-                null;
-            }
-          }
-
-          if (!cancelled && (seedPitstop || seedDestination)) {
-            onAutoSeedRoutinePlaces(seedPitstop, seedDestination);
-          }
-        }
-      } catch (err) {
-        console.error('Error discovering nearby places via Places API (New):', err);
-        notifyQuotaIfApplicable(err);
-        if (!cancelled) {
-          onNearbySuggestionsLoaded([], false);
-        }
-      }
-    }
-
-    loadNearbyAndSeed();
-    return () => {
-      cancelled = true;
-    };
-  }, [
-    placesLib,
-    userLocation.lat,
-    userLocation.lng,
-    activeRoutine.id,
-    activeRoutine.pitstopCategory,
-    searchCategoryFilter,
-  ]);
-
-  // 3. Compute Multi-Stop Traffic-Aware & Shortest Routes via Route.computeRoutes
-  useEffect(() => {
-    if (!routesLib || !map) return;
-
-    const destinationPlace = activeRoutine.destination;
-    const pitstopPlace =
-      activeRoutine.includePitstopInRoute && activeRoutine.preferredPitstop
-        ? activeRoutine.preferredPitstop
-        : null;
-
-    // Clean up existing polylines
-    polylinesRef.current.forEach((p) => p.setMap(null));
-    polylinesRef.current = [];
-
-    if (!destinationPlace && !pitstopPlace) {
-      onRoutesComputed([], false, null);
-      return;
-    }
-
-    const finalTarget = destinationPlace || pitstopPlace!;
-    const intermediateWaypoints =
-      destinationPlace && pitstopPlace && pitstopPlace.placeId !== destinationPlace.placeId
-        ? [
-            {
-              location: pitstopPlace.location,
-              vehicleStopover: true,
-            },
-          ]
-        : [];
-
-    let cancelled = false;
-    onRoutesComputed([], true, null);
-
-    const request: any = {
-      origin: userLocation,
-      destination: finalTarget.location,
-      travelMode: travelMode,
-      computeAlternativeRoutes: true,
-      fields: [
-        'path',
-        'distanceMeters',
-        'durationMillis',
-        'staticDurationMillis',
-        'viewport',
-        'legs',
-        'description',
-        'warnings',
-      ],
-      internalUsageAttributionIds: ['gmp_mcp_codeassist_v1_aistudio'],
-    };
-
-    if (intermediateWaypoints.length > 0) {
-      request.intermediates = intermediateWaypoints;
-    }
-
-    (routesLib.Route as any)
-      .computeRoutes(request)
-      .then((response: any) => {
-        if (cancelled) return;
-        const rawRoutes: any[] = response?.routes || [];
-        if (rawRoutes.length === 0) {
-          onRoutesComputed([], false, 'No route found between the selected locations.');
-          return;
-        }
-
-        // Determine shortest distance index and fastest duration index
-        let minDistance = Infinity;
-        let shortestIdx = 0;
-        let minDuration = Infinity;
-        let fastestIdx = 0;
-
-        rawRoutes.forEach((r, idx) => {
-          const dist = r.distanceMeters ?? Infinity;
-          const dur = r.durationMillis ?? Infinity;
-          if (dist < minDistance) {
-            minDistance = dist;
-            shortestIdx = idx;
-          }
-          if (dur < minDuration) {
-            minDuration = dur;
-            fastestIdx = idx;
-          }
-        });
-
-        const parsedRoutes: ComputedRouteOption[] = rawRoutes.map((r, idx) => {
-          const distanceMeters = r.distanceMeters ?? 0;
-          const durationMillis = r.durationMillis ?? 0;
-          const staticDurationMillis = r.staticDurationMillis ?? durationMillis;
-          const delayMs = Math.max(0, durationMillis - staticDurationMillis);
-          const trafficDelayMinutes = Math.round(delayMs / 60000);
-
-          const ratio =
-            staticDurationMillis > 0 ? durationMillis / staticDurationMillis : 1;
-          let trafficCondition: 'CLEAR' | 'MODERATE' | 'HEAVY' = 'CLEAR';
-          if (ratio > 1.25 || trafficDelayMinutes >= 6) {
-            trafficCondition = 'HEAVY';
-          } else if (ratio > 1.1 || trafficDelayMinutes >= 2) {
-            trafficCondition = 'MODERATE';
-          }
-
-          const isShortestDistance = idx === shortestIdx;
-          const isFastestDuration = idx === fastestIdx;
-
-          let label = `Alternative Route ${idx + 1}`;
-          if (isShortestDistance && isFastestDuration) {
-            label = 'Shortest & Fastest Route';
-          } else if (isShortestDistance) {
-            label = 'Shortest Distance Route';
-          } else if (isFastestDuration) {
-            label = 'Fastest Traffic-Aware Route';
-          }
-
-          const legs: RouteLegDetail[] = (r.legs || []).map((leg: any, legIdx: number) => {
-            const legLabel =
-              intermediateWaypoints.length > 0
-                ? legIdx === 0
-                  ? `Leg 1: Current Location to ${pitstopPlace?.displayName}`
-                  : `Leg 2: ${pitstopPlace?.displayName} to ${destinationPlace?.displayName}`
-                : `Direct to ${finalTarget.displayName}`;
-
-            const steps: RouteStepDetail[] = (leg.steps || []).map((step: any) => {
-              let startLoc: GeoLocation | undefined;
-              if (step.startLocation) {
-                const lat =
-                  typeof step.startLocation.lat === 'function'
-                    ? step.startLocation.lat()
-                    : step.startLocation.lat;
-                const lng =
-                  typeof step.startLocation.lng === 'function'
-                    ? step.startLocation.lng()
-                    : step.startLocation.lng;
-                if (typeof lat === 'number' && typeof lng === 'number') {
-                  startLoc = { lat, lng };
-                }
-              }
-              return {
-                instruction:
-                  step.instructions ||
-                  step.navigationInstruction?.instructions ||
-                  'Continue along route',
-                distanceMeters: step.distanceMeters ?? 0,
-                durationMillis:
-                  step.staticDurationMillis ?? step.durationMillis ?? 0,
-                startLocation: startLoc,
-              };
-            });
-
-            return {
-              legIndex: legIdx,
-              label: legLabel,
-              distanceMeters: leg.distanceMeters ?? 0,
-              durationMillis: leg.durationMillis ?? 0,
-              staticDurationMillis: leg.staticDurationMillis ?? leg.durationMillis ?? 0,
-              steps,
-            };
-          });
-
-          const rawPath: any[] = r.path || [];
-          const pathCoordinates: GeoLocation[] = rawPath
-            .map((pt: any) => {
-              const lat = typeof pt.lat === 'function' ? pt.lat() : pt.lat;
-              const lng = typeof pt.lng === 'function' ? pt.lng() : pt.lng;
-              return typeof lat === 'number' && typeof lng === 'number' ? { lat, lng } : null;
-            })
-            .filter((pt): pt is GeoLocation => pt !== null);
-
-          return {
-            index: idx,
-            label,
-            isShortestDistance,
-            isFastestDuration,
-            distanceMeters,
-            durationMillis,
-            staticDurationMillis,
-            trafficDelayMinutes,
-            trafficCondition,
-            description: r.description || `Route via local corridor`,
-            warnings: r.warnings || [],
-            legs,
-            pathCoordinates,
-            rawRoute: r,
-          };
-        });
-
-        // Automatically select the preferred route based on user's optimization preference
-        const preferredIdx =
-          optimizationMode === 'SHORTEST_DISTANCE' ? shortestIdx : fastestIdx;
-        onSelectRouteIndex(preferredIdx);
-        onRoutesComputed(parsedRoutes, false, null);
-
-        if (rawRoutes[preferredIdx]?.viewport) {
-          map.fitBounds(rawRoutes[preferredIdx].viewport, 56);
-        }
-      })
-      .catch((err: any) => {
-        if (cancelled) return;
-        console.error('Error computing routes:', err);
-        notifyQuotaIfApplicable(err);
-        onRoutesComputed(
-          [],
-          false,
-          err?.message || 'Unable to compute route. Please check your connection or API quota.'
-        );
-      });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [
-    routesLib,
-    map,
-    userLocation.lat,
-    userLocation.lng,
-    activeRoutine.destination?.placeId,
-    activeRoutine.preferredPitstop?.placeId,
-    activeRoutine.includePitstopInRoute,
-    travelMode,
-    optimizationMode,
-  ]);
-
-  return null;
-};
+const DARK_TILES =
+  'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png';
+const LIGHT_TILES =
+  'https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png';
 
 export const CommuteMapCanvas: React.FC<CommuteMapCanvasProps> = (props) => {
   const {
     userLocation,
     simulatedPosition,
     activeRoutine,
+    optimizationMode,
     selectedRouteIndex,
     onSelectRouteIndex,
+    onRoutesComputed,
     nearbySuggestions,
+    onNearbySuggestionsLoaded,
+    onAutoSeedRoutinePlaces,
     onSwapPitstop,
     onSetDestination,
+    searchCategoryFilter,
+    isDarkMode = true,
+    isCompactPip = false,
+    isMapVisible = true,
   } = props;
 
-  const map = useMap();
+  const mapContainerRef = useRef<HTMLDivElement | null>(null);
+  const mapRef = useRef<L.Map | null>(null);
+  const tileLayerRef = useRef<L.TileLayer | null>(null);
+  const routeLayerGroupRef = useRef<L.LayerGroup | null>(null);
+  const markersLayerGroupRef = useRef<L.LayerGroup | null>(null);
+  const userMarkerRef = useRef<L.Marker | null>(null);
+
+  const [computedRoutes, setComputedRoutes] = useState<ComputedRouteOption[]>([]);
   const [activeInfoPlace, setActiveInfoPlace] = useState<{
     place: LivePlace;
     role: 'PITSTOP' | 'DESTINATION' | 'SUGGESTION';
   } | null>(null);
 
-  const [computedRoutes, setComputedRoutes] = useState<ComputedRouteOption[]>([]);
-  const polylinesRef = useRef<google.maps.Polyline[]>([]);
+  const seededSlotsRef = useRef<Set<string>>(new Set());
+  const lastFittedKeyRef = useRef<string | null>(null);
 
-  const handleRoutesComputed = (
-    routes: ComputedRouteOption[],
-    isLoading: boolean,
-    error: string | null
-  ) => {
-    setComputedRoutes(routes);
-    props.onRoutesComputed(routes, isLoading, error);
-  };
-
-  // Render polylines whenever computedRoutes or selectedRouteIndex changes
+  // Stabilize route origin with a 250m deadband so mobile GPS sensor noise never triggers route recalculation or zoom twitching
+  const [stableOrigin, setStableOrigin] = useState<GeoLocation>(userLocation);
   useEffect(() => {
-    if (!map) return;
-    polylinesRef.current.forEach((p) => p.setMap(null));
-    polylinesRef.current = [];
+    setStableOrigin((prev) => {
+      if (getDistanceMeters(prev, userLocation) >= 250) {
+        return userLocation;
+      }
+      return prev;
+    });
+  }, [userLocation.lat, userLocation.lng]);
 
+  // 1. Initialize Leaflet Map Instance once
+  useEffect(() => {
+    if (!mapContainerRef.current || mapRef.current) return;
+
+    const map = L.map(mapContainerRef.current, {
+      center: [userLocation.lat, userLocation.lng],
+      zoom: 14,
+      zoomControl: !isCompactPip,
+      attributionControl: false,
+    });
+
+    const tileLayer = L.tileLayer(isDarkMode ? DARK_TILES : LIGHT_TILES, {
+      maxZoom: 19,
+      subdomains: 'abcd',
+    }).addTo(map);
+
+    const routeGroup = L.layerGroup().addTo(map);
+    const markersGroup = L.layerGroup().addTo(map);
+
+    mapRef.current = map;
+    tileLayerRef.current = tileLayer;
+    routeLayerGroupRef.current = routeGroup;
+    markersLayerGroupRef.current = markersGroup;
+
+    const resizeObserver = new ResizeObserver(() => {
+      map.invalidateSize({ animate: false });
+    });
+    resizeObserver.observe(mapContainerRef.current);
+
+    return () => {
+      resizeObserver.disconnect();
+      map.remove();
+      mapRef.current = null;
+      tileLayerRef.current = null;
+      routeLayerGroupRef.current = null;
+      markersLayerGroupRef.current = null;
+      userMarkerRef.current = null;
+    };
+  }, []);
+
+  // 2. Switch Dark / Light Map Tiles seamlessly
+  useEffect(() => {
+    if (!tileLayerRef.current) return;
+    tileLayerRef.current.setUrl(isDarkMode ? DARK_TILES : LIGHT_TILES);
+  }, [isDarkMode]);
+
+  // 3. Discover Nearby OpenStreetMap Places & Auto-Seed Routine
+  useEffect(() => {
+    let cancelled = false;
+    onNearbySuggestionsLoaded([], true);
+
+    async function loadPlaces() {
+      const { places, suggestedDestination } = await discoverNearbyOpenPlaces(
+        stableOrigin,
+        searchCategoryFilter || activeRoutine.pitstopCategory,
+        activeRoutine.timeSlot
+      );
+      if (cancelled) return;
+
+      onNearbySuggestionsLoaded(places, false);
+
+      const isPitstopFar =
+        activeRoutine.preferredPitstop &&
+        getDistanceMeters(stableOrigin, activeRoutine.preferredPitstop.location) > 80000;
+      const isDestinationFar =
+        activeRoutine.destination &&
+        getDistanceMeters(stableOrigin, activeRoutine.destination.location) > 80000;
+
+      const needsPitstop = !activeRoutine.preferredPitstop || isPitstopFar;
+      const needsDestination = !activeRoutine.destination || isDestinationFar;
+
+      const slotKey = `${activeRoutine.id}_${stableOrigin.lat.toFixed(2)}_${stableOrigin.lng.toFixed(2)}`;
+      if ((needsPitstop || needsDestination) && !seededSlotsRef.current.has(slotKey)) {
+        seededSlotsRef.current.add(slotKey);
+        const seedPitstop = needsPitstop
+          ? places[0] || null
+          : activeRoutine.preferredPitstop;
+        const seedDestination = needsDestination
+          ? suggestedDestination
+          : activeRoutine.destination;
+
+        onAutoSeedRoutinePlaces(seedPitstop, seedDestination);
+      }
+    }
+
+    loadPlaces();
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    stableOrigin.lat,
+    stableOrigin.lng,
+    activeRoutine.id,
+    activeRoutine.timeSlot,
+    activeRoutine.pitstopCategory,
+    searchCategoryFilter,
+  ]);
+
+  // 4. Compute Driving Routes via Free OSRM Engine
+  useEffect(() => {
+    const destinationPlace = activeRoutine.destination;
+    const pitstopPlace =
+      activeRoutine.includePitstopInRoute && activeRoutine.preferredPitstop
+        ? activeRoutine.preferredPitstop
+        : null;
+
+    if (!destinationPlace && !pitstopPlace) {
+      setComputedRoutes([]);
+      onRoutesComputed([], false, null);
+      return;
+    }
+
+    const finalTarget = destinationPlace || pitstopPlace!;
+    if (getDistanceMeters(stableOrigin, finalTarget.location) > 80000) {
+      return;
+    }
+
+    let cancelled = false;
+
+    computeOpenDrivingRoutes(stableOrigin, pitstopPlace, destinationPlace).then(
+      (routes) => {
+        if (cancelled) return;
+        setComputedRoutes(routes);
+
+        if (routes.length > 0) {
+          const preferredIdx =
+            optimizationMode === 'SHORTEST_DISTANCE'
+              ? routes.find((r) => r.isShortestDistance)?.index ?? 0
+              : routes.find((r) => r.isFastestDuration)?.index ?? 0;
+          onSelectRouteIndex(preferredIdx);
+          onRoutesComputed(routes, false, null);
+        } else {
+          onRoutesComputed([], false, null);
+        }
+      }
+    );
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    stableOrigin.lat,
+    stableOrigin.lng,
+    activeRoutine.destination?.placeId,
+    activeRoutine.preferredPitstop?.placeId,
+    activeRoutine.includePitstopInRoute,
+    optimizationMode,
+  ]);
+
+  // 5. Render Route Polylines Atomically (No Flicker)
+  useEffect(() => {
+    const routeGroup = routeLayerGroupRef.current;
+    if (!routeGroup) return;
+
+    routeGroup.clearLayers();
     if (computedRoutes.length === 0) return;
 
-    // Draw non-selected routes first so selected route sits on top
     const ordered = [...computedRoutes].sort((a, b) =>
       a.index === selectedRouteIndex ? 1 : b.index === selectedRouteIndex ? -1 : 0
     );
 
     ordered.forEach((routeOpt) => {
       const isSelected = routeOpt.index === selectedRouteIndex;
-      if (typeof routeOpt.rawRoute?.createPolylines === 'function') {
-        const created: google.maps.Polyline[] = routeOpt.rawRoute.createPolylines();
-        created.forEach((poly) => {
-          const strokeColor = isSelected
-            ? routeOpt.trafficCondition === 'HEAVY'
-              ? '#d97706'
-              : '#2563eb'
-            : '#64748b';
+      const latLngs: L.LatLngExpression[] = routeOpt.pathCoordinates.map((pt) => [
+        pt.lat,
+        pt.lng,
+      ]);
 
-          poly.setOptions({
-            strokeColor,
-            strokeOpacity: isSelected ? 0.95 : 0.45,
-            strokeWeight: isSelected ? 6 : 4,
-            zIndex: isSelected ? 20 : 5,
-            clickable: true,
-          });
-          poly.addListener('click', () => {
-            onSelectRouteIndex(routeOpt.index);
-          });
-          poly.setMap(map);
-          polylinesRef.current.push(poly);
-        });
+      if (latLngs.length < 2) return;
+
+      // Subtle glow for selected route
+      if (isSelected) {
+        L.polyline(latLngs, {
+          color: routeOpt.trafficCondition === 'HEAVY' ? '#f59e0b' : '#3b82f6',
+          weight: 10,
+          opacity: 0.25,
+          lineCap: 'round',
+          lineJoin: 'round',
+          interactive: false,
+        }).addTo(routeGroup);
       }
+
+      const poly = L.polyline(latLngs, {
+        color: isSelected
+          ? routeOpt.trafficCondition === 'HEAVY'
+            ? '#d97706'
+            : '#2563eb'
+          : '#64748b',
+        weight: isSelected ? 5 : 3.5,
+        opacity: isSelected ? 0.95 : 0.45,
+        lineCap: 'round',
+        lineJoin: 'round',
+      });
+
+      poly.on('click', () => {
+        onSelectRouteIndex(routeOpt.index);
+      });
+
+      poly.addTo(routeGroup);
+    });
+  }, [computedRoutes, selectedRouteIndex, onSelectRouteIndex]);
+
+  // 6. Update User Live Position Marker Smoothly Without Rebuilding Other Markers
+  const currentMarkerPos = simulatedPosition || userLocation;
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map) return;
+
+    const userIcon = L.divIcon({
+      className: 'bg-transparent border-0',
+      html: `<div style="width:28px;height:28px;border-radius:9999px;background:#0f172a;border:2.5px solid #ffffff;box-shadow:0 2px 8px rgba(0,0,0,0.45);display:flex;align-items:center;justify-content:center;">
+        <div style="width:10px;height:10px;border-radius:9999px;background:#3b82f6;"></div>
+      </div>`,
+      iconSize: [28, 28],
+      iconAnchor: [14, 14],
     });
 
-    return () => {
-      polylinesRef.current.forEach((p) => p.setMap(null));
-      polylinesRef.current = [];
-    };
-  }, [map, computedRoutes, selectedRouteIndex]);
+    if (!userMarkerRef.current) {
+      userMarkerRef.current = L.marker([currentMarkerPos.lat, currentMarkerPos.lng], {
+        icon: userIcon,
+        zIndexOffset: 1000,
+      }).addTo(map);
+    } else {
+      userMarkerRef.current.setLatLng([currentMarkerPos.lat, currentMarkerPos.lng]);
+    }
+  }, [currentMarkerPos.lat, currentMarkerPos.lng]);
 
-  // Re-fit bounds when switching between full route view and compact PiP mode
+  // 7. Render Pitstop, Destination & Nearby Suggestion Markers
   useEffect(() => {
-    if (!map || computedRoutes.length === 0) return;
+    const markersGroup = markersLayerGroupRef.current;
+    if (!markersGroup) return;
+
+    markersGroup.clearLayers();
+
+    // Active Pitstop Marker
+    if (
+      activeRoutine.preferredPitstop &&
+      (!isCompactPip || activeRoutine.includePitstopInRoute)
+    ) {
+      const pitstop = activeRoutine.preferredPitstop;
+      const bg = activeRoutine.includePitstopInRoute ? '#d97706' : '#475569';
+      const labelHtml = isCompactPip
+        ? `☕`
+        : `☕ <span style="margin-left:4px;max-width:110px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${pitstop.displayName}</span>`;
+
+      const icon = L.divIcon({
+        className: 'bg-transparent border-0',
+        html: `<div style="display:inline-flex;align-items:center;padding:4px 8px;border-radius:10px;background:${bg};color:#ffffff;border:2px solid #ffffff;font-size:11px;font-weight:600;box-shadow:0 2px 6px rgba(0,0,0,0.35);white-space:nowrap;">${labelHtml}</div>`,
+        iconSize: isCompactPip ? [28, 28] : [130, 28],
+        iconAnchor: isCompactPip ? [14, 14] : [65, 14],
+      });
+
+      const m = L.marker([pitstop.location.lat, pitstop.location.lng], {
+        icon,
+        zIndexOffset: 800,
+      });
+      if (!isCompactPip) {
+        m.on('click', () => setActiveInfoPlace({ place: pitstop, role: 'PITSTOP' }));
+      }
+      m.addTo(markersGroup);
+    }
+
+    // Active Destination Marker
+    if (activeRoutine.destination) {
+      const dest = activeRoutine.destination;
+      const labelHtml = isCompactPip
+        ? `🏁`
+        : `🏢 <span style="margin-left:4px;max-width:110px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${dest.displayName}</span>`;
+
+      const icon = L.divIcon({
+        className: 'bg-transparent border-0',
+        html: `<div style="display:inline-flex;align-items:center;padding:4px 8px;border-radius:10px;background:#2563eb;color:#ffffff;border:2px solid #ffffff;font-size:11px;font-weight:600;box-shadow:0 2px 6px rgba(0,0,0,0.35);white-space:nowrap;">${labelHtml}</div>`,
+        iconSize: isCompactPip ? [28, 28] : [130, 28],
+        iconAnchor: isCompactPip ? [14, 14] : [65, 14],
+      });
+
+      const m = L.marker([dest.location.lat, dest.location.lng], {
+        icon,
+        zIndexOffset: 850,
+      });
+      if (!isCompactPip) {
+        m.on('click', () => setActiveInfoPlace({ place: dest, role: 'DESTINATION' }));
+      }
+      m.addTo(markersGroup);
+    }
+
+    // Nearby Suggested Stops (Hidden in compact PiP mode)
+    if (!isCompactPip) {
+      nearbySuggestions
+        .filter(
+          (s) =>
+            s.placeId !== activeRoutine.preferredPitstop?.placeId &&
+            s.placeId !== activeRoutine.destination?.placeId
+        )
+        .slice(0, 5)
+        .forEach((suggestion) => {
+          const icon = L.divIcon({
+            className: 'bg-transparent border-0',
+            html: `<div style="display:inline-flex;align-items:center;padding:3px 7px;border-radius:8px;background:#ffffff;color:#0f172a;border:1.5px solid #cbd5e1;font-size:10px;font-weight:600;box-shadow:0 1px 4px rgba(0,0,0,0.2);white-space:nowrap;">✨ <span style="margin-left:3px;max-width:90px;overflow:hidden;text-overflow:ellipsis;">${suggestion.displayName}</span></div>`,
+            iconSize: [110, 24],
+            iconAnchor: [55, 12],
+          });
+
+          const m = L.marker([suggestion.location.lat, suggestion.location.lng], {
+            icon,
+            zIndexOffset: 500,
+          });
+          m.on('click', () =>
+            setActiveInfoPlace({ place: suggestion, role: 'SUGGESTION' })
+          );
+          m.addTo(markersGroup);
+        });
+    }
+  }, [
+    activeRoutine.preferredPitstop,
+    activeRoutine.destination,
+    activeRoutine.includePitstopInRoute,
+    nearbySuggestions,
+    isCompactPip,
+  ]);
+
+  // 8. Fit Map Bounds ONCE per Route / View Change (Never Fight User Zoom)
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !isMapVisible || computedRoutes.length === 0) return;
+
+    const fitSignature = [
+      activeRoutine.id,
+      activeRoutine.destination?.placeId || 'none',
+      activeRoutine.includePitstopInRoute
+        ? activeRoutine.preferredPitstop?.placeId || 'none'
+        : 'direct',
+      isCompactPip ? 'pip' : 'full',
+    ].join('::');
+
+    if (lastFittedKeyRef.current === fitSignature) {
+      return;
+    }
+
     const activeRoute =
-      computedRoutes.find((r) => r.index === selectedRouteIndex) || computedRoutes[0];
-    if (activeRoute?.rawRoute?.viewport) {
+      computedRoutes.find((r) => r.index === selectedRouteIndex) ||
+      computedRoutes[0];
+    if (activeRoute && activeRoute.pathCoordinates.length >= 2) {
+      lastFittedKeyRef.current = fitSignature;
       const timer = window.setTimeout(() => {
         try {
-          map.fitBounds(activeRoute.rawRoute.viewport, props.isCompactPip ? 22 : 56);
+          map.invalidateSize({ animate: false });
+          const bounds = L.latLngBounds(
+            activeRoute.pathCoordinates.map((pt) => [pt.lat, pt.lng])
+          );
+          map.fitBounds(bounds, {
+            padding: isCompactPip ? [22, 22] : [48, 48],
+            animate: false,
+          });
         } catch {
           // ignore
         }
-      }, 120);
+      }, 90);
       return () => window.clearTimeout(timer);
     }
-  }, [map, props.isCompactPip, computedRoutes, selectedRouteIndex]);
-
-  const currentMarkerPos = simulatedPosition || userLocation;
+  }, [
+    isMapVisible,
+    isCompactPip,
+    computedRoutes,
+    selectedRouteIndex,
+    activeRoutine.id,
+    activeRoutine.destination?.placeId,
+    activeRoutine.preferredPitstop?.placeId,
+    activeRoutine.includePitstopInRoute,
+  ]);
 
   return (
-    <div className={`relative w-full h-full ${props.isCompactPip ? 'min-h-[180px]' : 'min-h-[380px]'}`}>
-      <Map
-        mapId="DEMO_MAP_ID"
-        defaultCenter={userLocation}
-        defaultZoom={14}
-        colorScheme={props.isDarkMode ? 'DARK' : 'LIGHT'}
-        gestureHandling="greedy"
-        disableDefaultUI={Boolean(props.isCompactPip)}
-        streetViewControl={false}
-        mapTypeControl={false}
-        fullscreenControl={false}
-        internalUsageAttributionIds={['gmp_mcp_codeassist_v1_aistudio']}
-        className="w-full h-full"
-      >
-        <MapController
-          {...props}
-          onRoutesComputed={handleRoutesComputed}
-          onMarkerSelect={(p) =>
-            setActiveInfoPlace(p ? { place: p, role: 'SUGGESTION' } : null)
-          }
-        />
+    <div
+      className={`relative w-full h-full ${
+        isCompactPip ? 'min-h-[180px]' : 'min-h-[380px]'
+      }`}
+    >
+      <div ref={mapContainerRef} className="w-full h-full z-10" />
 
-        {/* User Live / Simulated Position Marker */}
-        <AdvancedMarker
-          position={currentMarkerPos}
-          title={simulatedPosition ? 'Simulated Commute Vehicle' : 'Your Current Location'}
-          zIndex={40}
+      {/* Selected Place Card Overlay (Hidden in PiP Mode) */}
+      {!isCompactPip && activeInfoPlace && (
+        <div
+          className={`absolute bottom-3 left-3 right-3 z-30 p-3.5 rounded-2xl border shadow-xl ${
+            isDarkMode
+              ? 'bg-slate-900/95 border-slate-700 text-slate-100'
+              : 'bg-white/95 border-slate-200 text-slate-900'
+          }`}
         >
-          <div className="flex items-center justify-center w-8 h-8 rounded-full bg-slate-900 text-white border-2 border-white shadow-md">
-            <Navigation className="w-3.5 h-3.5 text-blue-400" />
-          </div>
-        </AdvancedMarker>
-
-        {/* Active Routine Pitstop Marker (e.g., Morning Breakfast Stop) */}
-        {activeRoutine.preferredPitstop &&
-          (!props.isCompactPip || activeRoutine.includePitstopInRoute) && (
-            <AdvancedMarker
-              position={activeRoutine.preferredPitstop.location}
-              title={`Routine Pitstop: ${activeRoutine.preferredPitstop.displayName}`}
-              zIndex={35}
-              onClick={() => {
-                if (!props.isCompactPip) {
-                  setActiveInfoPlace({
-                    place: activeRoutine.preferredPitstop!,
-                    role: 'PITSTOP',
-                  });
-                }
-              }}
-            >
-              <div
-                className={`flex items-center gap-1 px-2 py-1 rounded-xl border-2 border-white shadow-md cursor-pointer transition-transform hover:scale-105 ${
-                  activeRoutine.includePitstopInRoute
-                    ? 'bg-amber-600 text-white'
-                    : 'bg-slate-600 text-white opacity-80'
-                }`}
-              >
-                <Coffee className="w-3 h-3 shrink-0" />
-                {!props.isCompactPip && (
-                  <span className="text-xs font-semibold max-w-[120px] truncate">
-                    {activeRoutine.preferredPitstop.displayName}
-                  </span>
-                )}
-              </div>
-            </AdvancedMarker>
-          )}
-
-        {/* Active Destination Marker (e.g., Office) */}
-        {activeRoutine.destination && (
-          <AdvancedMarker
-            position={activeRoutine.destination.location}
-            title={`Destination: ${activeRoutine.destination.displayName}`}
-            zIndex={35}
-            onClick={() => {
-              if (!props.isCompactPip) {
-                setActiveInfoPlace({
-                  place: activeRoutine.destination!,
-                  role: 'DESTINATION',
-                });
-              }
-            }}
-          >
-            <div className="flex items-center gap-1 px-2 py-1 rounded-xl bg-blue-600 text-white border-2 border-white shadow-md cursor-pointer transition-transform hover:scale-105">
-              <Building2 className="w-3 h-3 shrink-0" />
-              {!props.isCompactPip && (
-                <span className="text-xs font-semibold max-w-[120px] truncate">
-                  {activeRoutine.destination.displayName}
-                </span>
-              )}
-            </div>
-          </AdvancedMarker>
-        )}
-
-        {/* Nearby Suggested New Places Markers (Hidden in Map-Only PiP mode) */}
-        {!props.isCompactPip &&
-          nearbySuggestions
-            .filter(
-              (s) =>
-                s.placeId !== activeRoutine.preferredPitstop?.placeId &&
-                s.placeId !== activeRoutine.destination?.placeId
-            )
-            .slice(0, 6)
-            .map((suggestion) => (
-              <AdvancedMarker
-                key={suggestion.placeId}
-                position={suggestion.location}
-                title={`Suggested Stop: ${suggestion.displayName}`}
-                zIndex={25}
-                onClick={() =>
-                  setActiveInfoPlace({
-                    place: suggestion,
-                    role: 'SUGGESTION',
-                  })
-                }
-              >
-                <div className="flex items-center gap-1 px-2 py-1 rounded-lg bg-white text-slate-800 border border-slate-300 shadow-sm cursor-pointer hover:border-blue-600 transition-colors">
-                  <Sparkles className="w-3 h-3 text-blue-600 shrink-0" />
-                  <span className="text-[11px] font-medium max-w-[100px] truncate">
-                    {suggestion.displayName}
-                  </span>
-                </div>
-              </AdvancedMarker>
-            ))}
-
-        {/* Interactive InfoWindow for Selected Marker */}
-        {!props.isCompactPip && activeInfoPlace && (
-          <InfoWindow
-            position={activeInfoPlace.place.location}
-            onCloseClick={() => setActiveInfoPlace(null)}
-          >
-            <div className="p-1 max-w-[240px] text-slate-900">
-              <div className="text-xs font-medium text-slate-500 mb-0.5">
+          <div className="flex items-start justify-between gap-2">
+            <div>
+              <div className="text-[11px] font-medium text-blue-400">
                 {activeInfoPlace.role === 'PITSTOP'
                   ? 'Daily Routine Pitstop'
                   : activeInfoPlace.role === 'DESTINATION'
                   ? 'Primary Destination'
                   : 'Suggested Nearby Stop'}
               </div>
-              <h4 className="text-sm font-bold text-slate-900 leading-snug">
+              <h4 className="text-sm font-bold leading-snug">
                 {activeInfoPlace.place.displayName}
               </h4>
-              <p className="text-xs text-slate-600 mt-1 leading-relaxed">
+              <p className="text-xs text-slate-400 mt-0.5">
                 {activeInfoPlace.place.formattedAddress}
               </p>
-              <div className="flex items-center gap-1.5 text-xs text-slate-600 mt-1.5 tabular-nums">
-                {activeInfoPlace.place.rating && (
-                  <span>
-                    {activeInfoPlace.place.rating.toFixed(1)} ★
-                    {activeInfoPlace.place.userRatingCount
-                      ? ` (${activeInfoPlace.place.userRatingCount})`
-                      : ''}
-                  </span>
-                )}
-                {activeInfoPlace.place.rating && activeInfoPlace.place.businessStatus && (
-                  <span aria-hidden="true">·</span>
-                )}
-                {activeInfoPlace.place.businessStatus && (
-                  <span>
-                    {activeInfoPlace.place.businessStatus === 'OPERATIONAL'
-                      ? 'Open'
-                      : activeInfoPlace.place.businessStatus}
-                  </span>
-                )}
-              </div>
-
-              <div className="mt-3 flex flex-wrap gap-1.5">
-                {activeInfoPlace.role !== 'PITSTOP' && (
-                  <button
-                    type="button"
-                    onClick={() => {
-                      onSwapPitstop(activeInfoPlace.place);
-                      setActiveInfoPlace(null);
-                    }}
-                    className="flex-1 min-h-[36px] px-2.5 py-1.5 bg-slate-900 text-white text-xs font-medium rounded-lg hover:bg-slate-800 flex items-center justify-center gap-1"
-                  >
-                    <Plus className="w-3.5 h-3.5" />
-                    Set as Pitstop
-                  </button>
-                )}
-                {activeInfoPlace.role === 'PITSTOP' && (
-                  <span className="inline-flex items-center gap-1 text-xs font-medium text-emerald-700">
-                    <Check className="w-3.5 h-3.5" /> Active Pitstop
-                  </span>
-                )}
-                {activeInfoPlace.role === 'SUGGESTION' && (
-                  <button
-                    type="button"
-                    onClick={() => {
-                      onSetDestination(activeInfoPlace.place);
-                      setActiveInfoPlace(null);
-                    }}
-                    className="min-h-[36px] px-2.5 py-1.5 bg-slate-100 text-slate-800 text-xs font-medium rounded-lg hover:bg-slate-200"
-                  >
-                    Set Destination
-                  </button>
-                )}
-              </div>
-
-              {activeInfoPlace.place.googleMapsURI && (
-                <a
-                  href={activeInfoPlace.place.googleMapsURI}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="mt-2 inline-flex items-center gap-1 text-[11px] text-blue-600 hover:underline"
-                >
-                  Open in Google Maps <ExternalLink className="w-3 h-3" />
-                </a>
-              )}
-              <div className="mt-1 text-[10px] text-slate-400">Google Maps</div>
             </div>
-          </InfoWindow>
-        )}
-      </Map>
+            <button
+              type="button"
+              onClick={() => setActiveInfoPlace(null)}
+              className="p-1 text-slate-400 hover:text-slate-200"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+
+          <div className="mt-2.5 flex flex-wrap items-center gap-2">
+            {activeInfoPlace.role !== 'PITSTOP' && (
+              <button
+                type="button"
+                onClick={() => {
+                  onSwapPitstop(activeInfoPlace.place);
+                  setActiveInfoPlace(null);
+                }}
+                className="min-h-[34px] px-3 py-1 bg-blue-600 text-white text-xs font-semibold rounded-lg hover:bg-blue-500 flex items-center gap-1"
+              >
+                <Plus className="w-3.5 h-3.5" />
+                Set as Pitstop
+              </button>
+            )}
+            {activeInfoPlace.role === 'PITSTOP' && (
+              <span className="inline-flex items-center gap-1 text-xs font-medium text-emerald-400">
+                <Check className="w-3.5 h-3.5" /> Active Pitstop
+              </span>
+            )}
+            {activeInfoPlace.role === 'SUGGESTION' && (
+              <button
+                type="button"
+                onClick={() => {
+                  onSetDestination(activeInfoPlace.place);
+                  setActiveInfoPlace(null);
+                }}
+                className={`min-h-[34px] px-3 py-1 text-xs font-medium rounded-lg border ${
+                  isDarkMode
+                    ? 'border-slate-700 bg-slate-800 text-slate-200'
+                    : 'border-slate-200 bg-slate-100 text-slate-800'
+                }`}
+              >
+                Set Destination
+              </button>
+            )}
+            {activeInfoPlace.place.googleMapsURI && (
+              <a
+                href={activeInfoPlace.place.googleMapsURI}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="ml-auto inline-flex items-center gap-1 text-xs text-blue-400 hover:underline"
+              >
+                Open Map <ExternalLink className="w-3 h-3" />
+              </a>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   );
 };

@@ -1,6 +1,4 @@
-// Source: Google Maps Platform Code Assist
 import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
-import { APIProvider } from '@vis.gl/react-google-maps';
 import {
   Navigation,
   AlertTriangle,
@@ -42,8 +40,6 @@ import {
   triggerDrivingNotification,
 } from './utils/drivingNotifier';
 import { drawRouteToPipCanvas } from './utils/pipCanvasStream';
-
-const API_KEY = import.meta.env.VITE_GOOGLE_MAPS_API_KEY || '';
 
 const DEFAULT_COORDS: GeoLocation = {
   lat: 37.7858,
@@ -153,17 +149,8 @@ function formatDuration(millis: number): string {
 }
 
 export default function App() {
-  // Mandatory Tier 1 & Tier 2 Quota Defense
-  const [quotaExceeded, setQuotaExceeded] = useState(false);
-
-  useEffect(() => {
-    const handleQuotaExceeded = () => setQuotaExceeded(true);
-    window.addEventListener('gmp-quota-exceeded', handleQuotaExceeded);
-    return () => window.removeEventListener('gmp-quota-exceeded', handleQuotaExceeded);
-  }, []);
-
   // PWA Install Hook
-  const { isInstallable, isInstalled, isIOS, install } = usePWAInstall();
+  const { isInstallable, isInstalled, install } = usePWAInstall();
   const [showIOSInstallModal, setShowIOSInstallModal] = useState(false);
 
   // Dark Mode State (persisted to localStorage, defaults to true)
@@ -412,13 +399,20 @@ export default function App() {
 
     const watchId = navigator.geolocation.watchPosition(
       (pos) => {
-        setUserLocation({
-          lat: pos.coords.latitude,
-          lng: pos.coords.longitude,
+        const nextLat = pos.coords.latitude;
+        const nextLng = pos.coords.longitude;
+        setUserLocation((prev) => {
+          const dLat = Math.abs(nextLat - prev.lat);
+          const dLng = Math.abs(nextLng - prev.lng);
+          // Ignore sub-15m GPS sensor noise to prevent marker/map twitching on mobile
+          if (dLat < 0.00014 && dLng < 0.00014) {
+            return prev;
+          }
+          return { lat: nextLat, lng: nextLng };
         });
         const speedMs = pos.coords.speed ?? 0;
         const speedKmh = Math.max(0, Math.round(speedMs * 3.6));
-        setDrivingSpeedKmh(speedKmh);
+        setDrivingSpeedKmh((prev) => (Math.abs(prev - speedKmh) >= 2 ? speedKmh : prev));
         setGpsLabel(speedKmh > 10 ? `Driving (${speedKmh} km/h)` : 'Live GPS active');
 
         // If driving speed (> 12 km/h) is detected for this time slot, notify once per slot
@@ -476,8 +470,8 @@ export default function App() {
     (pitstop: LivePlace | null, destination: LivePlace | null) => {
       updateCurrentRoutine((prev) => ({
         ...prev,
-        preferredPitstop: prev.preferredPitstop || pitstop,
-        destination: prev.destination || destination,
+        preferredPitstop: pitstop || prev.preferredPitstop,
+        destination: destination || prev.destination,
       }));
     },
     [updateCurrentRoutine]
@@ -586,46 +580,27 @@ export default function App() {
   }, [pipCorner]);
 
   return (
-    <APIProvider apiKey={API_KEY}>
-      <div
-        className={`min-h-screen flex flex-col transition-colors duration-200 ${
-          isDarkMode ? 'bg-slate-950 text-slate-100' : 'bg-white text-slate-900'
-        }`}
-      >
-        {/* Hidden Canvas & Video for Native OS-Level Picture-in-Picture Stream */}
-        <canvas
-          ref={pipCanvasRef}
-          width={420}
-          height={260}
-          className="sr-only pointer-events-none"
-        />
-        <video
-          ref={pipVideoRef}
-          muted
-          playsInline
-          className="sr-only pointer-events-none"
-        />
+    <div
+      className={`min-h-screen flex flex-col transition-colors duration-200 ${
+        isDarkMode ? 'bg-slate-950 text-slate-100' : 'bg-white text-slate-900'
+      }`}
+    >
+      {/* Hidden Canvas & Video for Native OS-Level Picture-in-Picture Stream */}
+      <canvas
+        ref={pipCanvasRef}
+        width={420}
+        height={260}
+        className="sr-only pointer-events-none"
+      />
+      <video
+        ref={pipVideoRef}
+        muted
+        playsInline
+        className="sr-only pointer-events-none"
+      />
 
-        {/* Mandatory Google Maps Platform Demo Quota Banner */}
-        {quotaExceeded && (
-          <div className="bg-amber-50 border-b border-amber-200 text-amber-900 px-4 py-2.5 text-xs md:text-sm text-center sticky top-0 z-50 shadow-sm">
-            <span>
-              Google Maps Platform quota reached. If you are the app owner, visit{' '}
-              <a
-                href="https://developers.google.com/maps/ai/ai-studio?utm_campaign=gmp_mcp_codeassist_v1_aistudio#quota_exceeded_errors"
-                target="_blank"
-                rel="noopener noreferrer"
-                className="underline font-semibold text-amber-950 hover:text-amber-800"
-              >
-                maps developer site
-              </a>{' '}
-              for instructions to update your account.
-            </span>
-          </div>
-        )}
-
-        {/* Minimal Top Bar */}
-        <header className="w-full max-w-xl mx-auto px-4 pt-4 pb-2 flex items-center justify-between gap-2">
+      {/* Minimal Top Bar */}
+      <header className="w-full max-w-xl mx-auto px-4 pt-4 pb-2 flex items-center justify-between gap-2">
           <div className="flex items-center gap-1.5 text-xs">
             <button
               type="button"
@@ -715,7 +690,7 @@ export default function App() {
               <span>{isPipMode ? 'Exit PiP' : 'PiP Map'}</span>
             </button>
 
-            {!isInstalled && (isInstallable || isIOS) && (
+            {!isInstalled && (
               <button
                 type="button"
                 onClick={() => {
@@ -726,9 +701,10 @@ export default function App() {
                   }
                 }}
                 className="min-h-[38px] px-2.5 py-1 rounded-lg bg-blue-600 text-white text-xs font-medium flex items-center gap-1 hover:bg-blue-500 transition-colors"
+                title="Install StrideRoute on your phone"
               >
                 <Download className="w-3.5 h-3.5" />
-                <span className="hidden sm:inline">Install</span>
+                <span>Install</span>
               </button>
             )}
 
@@ -1161,7 +1137,7 @@ export default function App() {
                     ))
                   )}
                   <div className="pt-1.5 text-[10px] text-slate-500 text-right">
-                    Google Maps
+                    OpenStreetMap
                   </div>
                 </div>
               )}
@@ -1176,7 +1152,7 @@ export default function App() {
               ? 'contents'
               : screenMode === 'route'
               ? 'flex-1 w-full max-w-xl mx-auto px-4 pb-8 flex flex-col gap-4'
-              : 'sr-only h-0 overflow-hidden pointer-events-none'
+              : 'fixed -left-[9999px] top-0 w-[380px] h-[380px] opacity-0 pointer-events-none overflow-hidden'
           }
         >
           {/* Back button & current route header (hidden in PiP map-only mode) */}
@@ -1402,6 +1378,7 @@ export default function App() {
               searchCategoryFilter={currentConfig.defaultSearchCategory}
               isDarkMode={isDarkMode}
               isCompactPip={isPipMode}
+              isMapVisible={screenMode === 'route' || isPipMode}
             />
           </div>
 
@@ -1453,7 +1430,7 @@ export default function App() {
                 ))}
               </div>
               <div className="mt-2 text-[10px] text-slate-500 text-right">
-                Google Maps
+                OpenStreetMap · OSRM
               </div>
             </div>
           )}
@@ -1516,29 +1493,73 @@ export default function App() {
           </div>
         )}
 
-        {/* iOS Install Guide Modal */}
+        {/* Phone Install Guide Modal (Android & iOS) */}
         {showIOSInstallModal && (
           <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-xs flex items-center justify-center p-4">
             <div
-              className={`border rounded-3xl max-w-sm w-full p-5 space-y-3 shadow-xl ${
+              className={`border rounded-3xl max-w-sm w-full p-5 space-y-4 shadow-xl ${
                 isDarkMode
                   ? 'bg-slate-900 border-slate-800 text-slate-100'
                   : 'bg-white border-slate-200 text-slate-900'
               }`}
             >
-              <h3 className="text-base font-bold font-display">Install on Home Screen</h3>
-              <p className="text-xs text-slate-400 leading-relaxed">
-                1. Tap the <strong>Share</strong> button in your browser toolbar.
-                <br />
-                2. Tap <strong>Add to Home Screen</strong> to enable standalone background commute
-                notifications.
-              </p>
+              <div className="flex items-center justify-between">
+                <h3 className="text-base font-bold font-display">Install on Your Phone</h3>
+                <button
+                  type="button"
+                  onClick={() => setShowIOSInstallModal(false)}
+                  className="min-h-[36px] min-w-[36px] flex items-center justify-center text-slate-400 hover:text-slate-200"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+
+              <div className="space-y-3 text-xs leading-relaxed">
+                <div
+                  className={`p-3 rounded-2xl border ${
+                    isDarkMode
+                      ? 'border-amber-500/30 bg-amber-500/10 text-amber-200'
+                      : 'border-amber-200 bg-amber-50 text-amber-900'
+                  }`}
+                >
+                  <div className="font-bold mb-1">Step 1: Enable Public Link First</div>
+                  Preview links are private by default (which causes a "Page not found" error on other devices). Click the <strong>Share</strong> (or <strong>Deploy</strong>) button in the top-right toolbar of AI Studio and enable <strong>Public access</strong> to copy your phone-ready link.
+                </div>
+
+                <div
+                  className={`p-3 rounded-2xl border ${
+                    isDarkMode
+                      ? 'border-slate-800 bg-slate-950/70 text-slate-300'
+                      : 'border-slate-200 bg-slate-50 text-slate-700'
+                  }`}
+                >
+                  <div className="font-bold text-blue-400 mb-1">Step 2: Android (Chrome)</div>
+                  1. Open that shared link in <strong>Chrome</strong> on your Android phone.
+                  <br />
+                  2. Tap the blue <strong>Install</strong> button or Chrome's <strong>⋮ menu</strong> → <strong>Install app / Add to Home screen</strong>.
+                </div>
+
+                <div
+                  className={`p-3 rounded-2xl border ${
+                    isDarkMode
+                      ? 'border-slate-800 bg-slate-950/70 text-slate-300'
+                      : 'border-slate-200 bg-slate-50 text-slate-700'
+                  }`}
+                >
+                  <div className="font-bold text-blue-400 mb-1">Step 2: iPhone (Safari)</div>
+                  1. Open that shared link in <strong>Safari</strong>.
+                  <br />
+                  2. Tap the <strong>Share</strong> icon at the bottom and tap{' '}
+                  <strong>Add to Home Screen</strong>.
+                </div>
+              </div>
+
               <button
                 type="button"
                 onClick={() => setShowIOSInstallModal(false)}
-                className="w-full min-h-[40px] rounded-xl bg-blue-600 text-white text-xs font-semibold"
+                className="w-full min-h-[42px] rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold transition-colors"
               >
-                Close
+                Got it
               </button>
             </div>
           </div>
@@ -1546,26 +1567,8 @@ export default function App() {
 
         {/* Quiet Footer */}
         <footer className="w-full max-w-md mx-auto px-6 py-3 text-center text-[11px] text-slate-500">
-          Google Maps ·{' '}
-          <a
-            href="https://maps.google.com/help/terms_maps/?utm_campaign=gmp_mcp_codeassist_v1_aistudio"
-            target="_blank"
-            rel="noopener noreferrer"
-            className="underline hover:text-slate-400"
-          >
-            Terms
-          </a>{' '}
-          ·{' '}
-          <a
-            href="https://policies.google.com/privacy?utm_campaign=gmp_mcp_codeassist_v1_aistudio"
-            target="_blank"
-            rel="noopener noreferrer"
-            className="underline hover:text-slate-400"
-          >
-            Privacy
-          </a>
+          Powered by OpenStreetMap & OSRM · 100% Free & Unlimited
         </footer>
       </div>
-    </APIProvider>
-  );
+    );
 }
